@@ -1,0 +1,408 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="BP Tracker">
+<meta name="theme-color" content="#ef4444">
+<title>BP Tracker</title>
+<link rel="manifest" href="./manifest.json">
+<link rel="apple-touch-icon" href="./icon-192.png">
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#0f0f1a;--bg2:#1a1a2e;--bg3:#16213e;--tx:#f8fafc;--tm:#94a3b8;--td:#64748b;--tf:#475569;--red:#ef4444;--org:#f97316;--blu:#3b82f6;--pur:#a855f7;--grn:#22c55e;--yel:#eab308;--brd:rgba(255,255,255,.06);--srf:rgba(255,255,255,.04);--ff:'DM Sans',-apple-system,sans-serif;--fm:'Space Mono',monospace}
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+html,body{height:100%;overflow:hidden}
+body{font-family:var(--ff);background:linear-gradient(145deg,var(--bg),var(--bg2) 40%,var(--bg3));color:#e2e8f0;-webkit-font-smoothing:antialiased}
+#mount{height:100%}
+.shell{height:100%;display:flex;flex-direction:column}
+::-webkit-scrollbar{width:4px}::-webkit-scrollbar-thumb{background:rgba(255,255,255,.1);border-radius:2px}
+@keyframes spin{to{transform:rotate(360deg)}}
+@keyframes pulse{0%,100%{opacity:.5}50%{opacity:1}}
+input[type=file]{display:none}
+input:focus{outline:0}
+button,label{font-family:var(--ff)}
+button:active{transform:scale(.97)}
+.boot{display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;gap:16px;color:var(--tm)}
+.boot-spin{width:32px;height:32px;border:3px solid rgba(255,255,255,.1);border-top-color:var(--red);border-radius:50%;animation:spin .8s linear infinite}
+.boot-err{color:var(--red);padding:40px 20px;text-align:center}
+</style>
+</head>
+<body>
+
+<div id="mount">
+  <div class="boot"><div class="boot-spin"></div><div style="font-size:14px">Loading BP Tracker...</div></div>
+</div>
+
+<!-- Local vendor scripts (no CDN dependency) -->
+<script src="./vendor/react.min.js"></script>
+<script src="./vendor/react-dom.min.js"></script>
+<script src="./vendor/recharts.js"></script>
+
+<script>
+(function(){
+"use strict";
+var mount=document.getElementById("mount");
+
+// Check libs loaded
+var missing=[];
+if(typeof React==="undefined")missing.push("React");
+if(typeof ReactDOM==="undefined")missing.push("ReactDOM");
+if(typeof Recharts==="undefined")missing.push("Recharts");
+if(missing.length){
+  mount.innerHTML='<div class="boot-err"><div style="font-size:48px;margin-bottom:16px">⚠️</div><div style="font-size:16px;font-weight:600;margin-bottom:8px">Failed to load: '+missing.join(", ")+'</div><div style="font-size:12px;color:#94a3b8;margin-bottom:20px">If testing locally, serve via HTTP (not file://). Try: npx serve</div><button onclick="location.reload()" style="padding:12px 24px;background:#ef4444;color:#fff;border:none;border-radius:10px;cursor:pointer">Retry</button></div>';
+  return;
+}
+
+// Service worker
+if("serviceWorker" in navigator)navigator.serviceWorker.register("./sw.js").catch(function(){});
+
+// Lazy-load Tesseract
+var ts=document.createElement("script");
+ts.src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js";
+document.head.appendChild(ts);
+
+var h=React.createElement;
+var useState=React.useState,useRef=React.useRef,useCallback=React.useCallback;
+var RC=Recharts;
+
+var CATS=[
+  {label:"Normal",sMin:0,dMin:0,color:"#22c55e",range:"<120 / <80"},
+  {label:"Elevated",sMin:120,dMin:0,color:"#eab308",range:"120-129 / <80"},
+  {label:"Stage 1",sMin:130,dMin:80,color:"#f97316",range:"130-139 / 80-89"},
+  {label:"Stage 2",sMin:140,dMin:90,color:"#ef4444",range:"\u2265140 / \u226590"},
+  {label:"Crisis",sMin:180,dMin:120,color:"#dc2626",range:">180 / >120"}
+];
+
+function classify(s,d){for(var i=CATS.length-1;i>=0;i--)if(s>=CATS[i].sMin||d>=CATS[i].dMin)return CATS[i];return CATS[0]}
+function fmtS(iso){return new Date(iso).toLocaleDateString("en-US",{month:"short",day:"numeric"})}
+function fmtF(iso){return new Date(iso).toLocaleString("en-US",{month:"short",day:"numeric",year:"numeric",hour:"numeric",minute:"2-digit",hour12:true})}
+function ldR(){try{return JSON.parse(localStorage.getItem("bp_readings")||"[]")}catch(e){return[]}}
+function stR(r){try{localStorage.setItem("bp_readings",JSON.stringify(r))}catch(e){}}
+function ldN(){try{return localStorage.getItem("bp_user_name")||""}catch(e){return""}}
+function stN(n){try{localStorage.setItem("bp_user_name",n)}catch(e){}}
+
+// OCR
+function doOCR(dataUrl,onP){
+  return new Promise(function(resolve){
+    function go(){
+      var img=new Image();
+      img.onload=function(){
+        var cv=document.createElement("canvas");var w=Math.min(img.width,1200),ht=Math.round(img.height/img.width*w);
+        cv.width=w;cv.height=ht;var ctx=cv.getContext("2d");ctx.drawImage(img,0,0,w,ht);
+        var id=ctx.getImageData(0,0,w,ht),px=id.data;
+        for(var i=0;i<px.length;i+=4){var g=.299*px[i]+.587*px[i+1]+.114*px[i+2];g=((g/255-.5)*2.5+.5)*255;g=Math.max(0,Math.min(255,g));var bw=g>140?255:0;px[i]=px[i+1]=px[i+2]=bw}
+        ctx.putImageData(id,0,0);
+        onP&&onP(.1,"Initializing OCR...");
+        Tesseract.recognize(cv.toDataURL("image/png"),"eng",{
+          logger:function(m){if(m.status==="recognizing text"&&m.progress)onP&&onP(.1+m.progress*.7,"Reading display...")},
+          tessedit_char_whitelist:"0123456789",tessedit_pageseg_mode:"6"
+        }).then(function(r){
+          onP&&onP(.95,"Parsing...");
+          var nums=(r.data.text.match(/\d{2,3}/g)||[]).map(Number).filter(function(n){return n>=30&&n<=300}).sort(function(a,b){return b-a});
+          if(nums.length>=3)resolve({sys:nums[0],dia:nums[1],pulse:nums[2]});
+          else if(nums.length>=2)resolve({sys:nums[0],dia:nums[1],pulse:null});
+          else resolve(null);
+        }).catch(function(){resolve(null)});
+      };
+      img.onerror=function(){resolve(null)};
+      img.src=dataUrl;
+    }
+    if(typeof Tesseract!=="undefined"){go();return}
+    onP&&onP(0,"Loading OCR engine...");
+    var tries=0,iv=setInterval(function(){tries++;if(typeof Tesseract!=="undefined"){clearInterval(iv);go()}else if(tries>30){clearInterval(iv);resolve(null)}},500);
+  });
+}
+
+function ChartTip(props){
+  if(!props.active||!props.payload||!props.payload.length)return null;
+  return h("div",{style:{background:"#1a1a2e",border:"1px solid rgba(255,255,255,.1)",borderRadius:10,padding:"10px 14px",boxShadow:"0 8px 32px rgba(0,0,0,.4)"}},
+    h("p",{style:{color:"#94a3b8",fontSize:10,marginBottom:4,fontFamily:"var(--fm)"}},props.label),
+    props.payload.map(function(p,i){return h("p",{key:i,style:{color:p.color,fontSize:12,fontWeight:600,margin:"2px 0"}},p.name+": "+p.value+(p.name==="Pulse"?" bpm":" mmHg"))}))
+}
+
+// ======================
+// MAIN APP
+// ======================
+function App(){
+  var _t=useState("capture"),tab=_t[0],setTab=_t[1];
+  var _r=useState(ldR),readings=_r[0],setReadings=_r[1];
+  var _n=useState(ldN),userName=_n[0],setUserName=_n[1];
+  var _en=useState(false),editN=_en[0],setEditN=_en[1];
+  var _ci=useState(null),capImg=_ci[0],setCapImg=_ci[1];
+  var _oc=useState(false),ocrOn=_oc[0],setOcrOn=_oc[1];
+  var _op=useState(0),ocrP=_op[0],setOcrP=_op[1];
+  var _os=useState(""),ocrSt=_os[0],setOcrSt=_os[1];
+  var _ev=useState({sys:"",dia:"",pulse:""}),ev=_ev[0],setEv=_ev[1];
+  var _m=useState(false),manual=_m[0],setManual=_m[1];
+  var _ms=useState(""),ms=_ms[0],setMs=_ms[1];
+  var _md=useState(""),md=_md[0],setMd=_md[1];
+  var _mp=useState(""),mp=_mp[0],setMp=_mp[1];
+
+  var persist=useCallback(function(r){setReadings(r);stR(r)},[]);
+  function persistN(n){var t=n.slice(0,40);setUserName(t);stN(t)}
+  function autoJ(val,setter,mx,nxt){var c=val.replace(/\D/g,"").slice(0,mx);setter(c);if(c.length>=mx&&nxt){var el=document.getElementById(nxt);if(el)el.focus()}}
+
+  function saveR(s,d,p){
+    var r={id:Date.now().toString(),timestamp:new Date().toISOString(),sys:parseInt(s),dia:parseInt(d),pulse:parseInt(p),name:userName||"Unknown"};
+    persist([r].concat(readings));setCapImg(null);setEv({sys:"",dia:"",pulse:""});setManual(false);setMs("");setMd("");setMp("");
+  }
+  function delR(id){persist(readings.filter(function(r){return r.id!==id}))}
+
+  function handleCap(e){
+    var file=e.target.files&&e.target.files[0];if(!file)return;e.target.value="";
+    var reader=new FileReader();
+    reader.onerror=function(){};
+    reader.onload=function(ev){
+      var img=new Image();
+      img.onerror=function(){setCapImg(ev.target.result);setTimeout(function(){var el=document.getElementById("ocr-sys");if(el)el.focus()},200)};
+      img.onload=function(){
+        try{
+          var M=800,w=img.width,ht=img.height;if(w>M||ht>M){var sc=M/Math.max(w,ht);w=Math.round(w*sc);ht=Math.round(ht*sc)}
+          var c=document.createElement("canvas");c.width=w;c.height=ht;c.getContext("2d").drawImage(img,0,0,w,ht);
+          var du=c.toDataURL("image/jpeg",.75);
+          setCapImg(du);
+          // Start OCR
+          setOcrOn(true);setOcrP(0);setOcrSt("Starting...");setEv({sys:"",dia:"",pulse:""});
+          doOCR(du,function(p,s){setOcrP(p);setOcrSt(s)}).then(function(result){
+            setOcrOn(false);
+            if(result)setEv({sys:result.sys?String(result.sys):"",dia:result.dia?String(result.dia):"",pulse:result.pulse?String(result.pulse):""});
+            setTimeout(function(){var el=document.getElementById("ocr-sys");if(el)el.focus()},200);
+          });
+        }catch(err){setCapImg(ev.target.result)}
+      };
+      img.src=ev.target.result;
+    };
+    reader.readAsDataURL(file);
+  }
+
+  function expCSV(){
+    if(!readings.length)return;
+    var hd=["Date","Time","Name","Systolic (mmHg)","Diastolic (mmHg)","Pulse (bpm)","Category"];
+    var rows=readings.slice().reverse().map(function(r){var d=new Date(r.timestamp);return[d.toLocaleDateString("en-US"),d.toLocaleTimeString("en-US",{hour:"numeric",minute:"2-digit",hour12:true}),r.name||"",r.sys,r.dia,r.pulse,classify(r.sys,r.dia).label]});
+    var csv=[hd].concat(rows).map(function(r){return r.map(function(c){return'"'+String(c).replace(/"/g,'""')+'"'}).join(",")}).join("\n");
+    var a=document.createElement("a");a.href=URL.createObjectURL(new Blob([csv],{type:"text/csv"}));a.download="bp-readings-"+new Date().toISOString().slice(0,10)+".csv";a.click();
+  }
+
+  function handleImp(e){
+    var file=e.target.files&&e.target.files[0];if(!file)return;e.target.value="";
+    var reader=new FileReader();
+    reader.onload=function(ev){
+      try{
+        var lines=ev.target.result.split("\n").filter(function(l){return l.trim()});
+        if(lines.length<2){alert("CSV appears empty.");return}
+        var imported=[];
+        for(var i=1;i<lines.length;i++){var cells=[],cur="",inQ=false;for(var j=0;j<lines[i].length;j++){var ch=lines[i][j];if(ch==='"')inQ=!inQ;else if(ch===","&&!inQ){cells.push(cur.trim());cur=""}else cur+=ch}cells.push(cur.trim());
+          if(cells.length>=6){var ts=new Date(cells[0]+" "+cells[1]);var timestamp=isNaN(ts.getTime())?new Date().toISOString():ts.toISOString();var sys=parseInt(cells[3]),dia=parseInt(cells[4]),pul=parseInt(cells[5]);
+          if(!isNaN(sys)&&!isNaN(dia)&&!isNaN(pul))imported.push({id:"i-"+Date.now()+"-"+i,timestamp:timestamp,sys:sys,dia:dia,pulse:pul,name:cells[2]||userName||"Imported"})}}
+        if(!imported.length){alert("No valid readings found.");return}
+        var ex={};readings.forEach(function(r){ex[r.timestamp]=true});
+        var nw=imported.filter(function(r){return!ex[r.timestamp]});
+        persist(readings.concat(nw).sort(function(a,b){return new Date(b.timestamp)-new Date(a.timestamp)}));
+        alert("Imported "+nw.length+" reading"+(nw.length!==1?"s":"")+(nw.length<imported.length?" ("+(imported.length-nw.length)+" duplicates skipped)":"")+".");
+      }catch(err){alert("Import failed: "+err.message)}
+    };reader.readAsText(file);
+  }
+
+  var chartData=readings.slice().reverse().map(function(r){return{date:fmtS(r.timestamp),Systolic:r.sys,Diastolic:r.dia,Pulse:r.pulse}});
+  var latest=readings[0]||null;
+  var lCat=latest?classify(latest.sys,latest.dia):null;
+  function avg(k){if(!readings.length)return 0;var s=0;for(var i=0;i<readings.length;i++)s+=readings[i][k];return Math.round(s/readings.length)}
+
+  // Styles
+  var brd="rgba(255,255,255,.06)",srf="rgba(255,255,255,.04)";
+  var card={background:srf,borderRadius:16,border:"1px solid "+brd,padding:20,marginBottom:16};
+  var btn={padding:12,borderRadius:10,cursor:"pointer",fontSize:13,fontWeight:600,border:"none",fontFamily:"inherit"};
+  function btnP(dis){return Object.assign({},btn,{background:dis?"rgba(255,255,255,.06)":"linear-gradient(135deg,#ef4444,#f97316)",color:dis?"#64748b":"#fff"})}
+  var btnS=Object.assign({},btn,{background:"transparent",border:"1px solid rgba(255,255,255,.1)",color:"#94a3b8"});
+  var btnE=Object.assign({},btn,{background:"rgba(34,197,94,.06)",border:"1px solid rgba(34,197,94,.2)",color:"#22c55e"});
+  var btnI=Object.assign({},btn,{background:"rgba(59,130,246,.06)",border:"1px solid rgba(59,130,246,.2)",color:"#3b82f6"});
+
+  function valField(id,label,color,value,key,nextId){
+    return h("div",{style:{flex:1,textAlign:"center",padding:"10px 8px",borderRadius:10,background:color+"11",border:"1px solid "+color+"33"}},
+      h("div",{style:{fontSize:10,fontWeight:700,fontFamily:"var(--fm)",marginBottom:4,color:color}},label),
+      h("input",{id:id,inputMode:"numeric",placeholder:"\u2014",value:value,
+        onChange:function(e){autoJ(e.target.value,function(v){setEv(function(p){var n={sys:p.sys,dia:p.dia,pulse:p.pulse};n[key]=v;return n})},3,nextId)},
+        onFocus:function(e){e.target.select()},
+        style:{width:"100%",background:"transparent",border:"none",color:"#f8fafc",fontSize:26,fontWeight:700,fontFamily:"var(--fm)",textAlign:"center",padding:0,outline:"none"}}))
+  }
+
+  // HEADER
+  var header=h("div",{style:{padding:"calc(env(safe-area-inset-top,0px) + 16px) 20px 12px",borderBottom:"1px solid "+brd,background:"rgba(15,15,26,.85)",backdropFilter:"blur(20px)",WebkitBackdropFilter:"blur(20px)",flexShrink:0,zIndex:100}},
+    h("div",{style:{maxWidth:600,margin:"0 auto"}},
+      h("div",{style:{display:"flex",alignItems:"center",gap:10,marginBottom:14}},
+        h("div",{style:{width:36,height:36,borderRadius:10,background:"linear-gradient(135deg,#ef4444,#f97316)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:18,color:"#fff",flexShrink:0}},"\u2665"),
+        h("div",null,
+          h("div",{style:{fontSize:18,fontWeight:700,letterSpacing:"-.02em",color:"#f8fafc"}},"BP Tracker"),
+          !editN&&userName?h("div",{style:{fontSize:12,color:"#94a3b8",fontFamily:"var(--fm)",cursor:"pointer"},onClick:function(){setEditN(true)}},userName+" \u270E"):
+          !editN?h("div",{style:{fontSize:12,color:"#94a3b8",fontFamily:"var(--fm)",cursor:"pointer",textDecoration:"underline",textDecorationStyle:"dotted"},onClick:function(){setEditN(true)}},"+\u00A0Set your name"):
+          h("input",{autoFocus:true,style:{background:"rgba(0,0,0,.3)",border:"1px solid rgba(255,255,255,.15)",borderRadius:6,padding:"4px 8px",color:"#f8fafc",fontSize:12,fontFamily:"var(--fm)",width:180,outline:"none",marginTop:2},
+            maxLength:40,value:userName,placeholder:"Your name",
+            onChange:function(e){setUserName(e.target.value.slice(0,40))},
+            onKeyDown:function(e){if(e.key==="Enter"){persistN(userName);setEditN(false)}},
+            onBlur:function(){persistN(userName);setEditN(false)}})
+        )),
+      h("div",{style:{display:"flex",gap:4,background:srf,borderRadius:10,padding:3}},
+        ["capture","trends","history"].map(function(t){
+          return h("button",{key:t,onClick:function(){setTab(t)},style:{flex:1,padding:"10px 0",border:"none",borderRadius:8,fontSize:13,fontWeight:600,fontFamily:"inherit",cursor:"pointer",background:tab===t?"rgba(255,255,255,.1)":"transparent",color:tab===t?"#f8fafc":"#64748b",boxShadow:tab===t?"0 2px 8px rgba(0,0,0,.2)":"none"}},
+            (t==="capture"?"\uD83D\uDCF7 ":t==="trends"?"\uD83D\uDCC8 ":"\uD83D\uDCCB ")+t.charAt(0).toUpperCase()+t.slice(1))}))
+    ));
+
+  // CAPTURE TAB
+  var latestCard=null;
+  if(latest)latestCard=h("div",{style:card},
+    h("p",{style:{fontSize:11,color:"#64748b",fontFamily:"var(--fm)",marginBottom:12}},"LATEST"+(latest.name?" \u00B7 "+latest.name:"")+" \u2014 "+fmtF(latest.timestamp)),
+    h("div",{style:{display:"flex",gap:16,alignItems:"center"}},
+      h("div",{style:{flex:1,textAlign:"center"}},h("div",{style:{fontSize:32,fontWeight:700,fontFamily:"var(--fm)",color:"#f8fafc"}},latest.sys+"/"+latest.dia),h("div",{style:{fontSize:11,color:"#64748b"}},"mmHg")),
+      h("div",{style:{width:1,height:40,background:"rgba(255,255,255,.08)"}}),
+      h("div",{style:{textAlign:"center"}},h("div",{style:{fontSize:24,fontWeight:700,fontFamily:"var(--fm)",color:"#f8fafc"}},latest.pulse),h("div",{style:{fontSize:11,color:"#64748b"}},"bpm")),
+      h("span",{style:{padding:"6px 12px",borderRadius:20,background:lCat.color+"22",color:lCat.color,fontSize:11,fontWeight:700,fontFamily:"var(--fm)",border:"1px solid "+lCat.color+"44"}},lCat.label)));
+
+  var photoSection=null;
+  if(capImg){
+    var inner;
+    if(ocrOn){
+      inner=h("div",{style:{textAlign:"center",padding:"16px 0"}},
+        h("div",{style:{fontSize:28,animation:"pulse 1.2s infinite"}},"\uD83D\uDD0D"),
+        h("div",{style:{color:"#94a3b8",fontSize:12,marginTop:6}},ocrSt),
+        h("div",{style:{width:"80%",margin:"8px auto 0",height:3,background:"rgba(255,255,255,.06)",borderRadius:2,overflow:"hidden"}},h("div",{style:{height:"100%",background:"#ef4444",borderRadius:2,transition:"width .3s",width:(ocrP*100)+"%"}})));
+    }else{
+      var detected=ev.sys&&ev.dia;
+      inner=h("div",null,
+        h("p",{style:{fontSize:11,fontWeight:700,marginBottom:12,fontFamily:"var(--fm)",color:detected?"#22c55e":"#eab308"}},detected?"\u2713 VALUES DETECTED \u2014 verify & save":"\u270F\uFE0F ENTER VALUES FROM DISPLAY"),
+        h("div",{style:{display:"flex",gap:12,marginBottom:16}},
+          valField("ocr-sys","SYS","#ef4444",ev.sys,"sys","ocr-dia"),
+          valField("ocr-dia","DIA","#3b82f6",ev.dia,"dia","ocr-pulse"),
+          valField("ocr-pulse","PULSE","#a855f7",ev.pulse,"pulse",null)),
+        h("div",{style:{display:"flex",gap:10}},
+          h("button",{style:Object.assign({},btnS,{flex:1}),onClick:function(){setCapImg(null);setEv({sys:"",dia:"",pulse:""})}},"Retake"),
+          h("button",{style:Object.assign({},btnP(!ev.sys||!ev.dia||!ev.pulse),{flex:2}),disabled:!ev.sys||!ev.dia||!ev.pulse,onClick:function(){saveR(ev.sys,ev.dia,ev.pulse)}},"\u2713 Save Reading")));
+    }
+    photoSection=h("div",{style:card},h("img",{src:capImg,style:{width:"100%",borderRadius:12,marginBottom:16,maxHeight:340,objectFit:"contain"}}),inner);
+  }
+
+  var captureButtons=null;
+  if(!capImg&&!manual){
+    captureButtons=h("div",{style:{display:"flex",flexDirection:"column",gap:12}},
+      h("label",{htmlFor:"bp-cam",style:{width:"100%",padding:"44px 20px",background:"rgba(255,255,255,.02)",border:"2px dashed rgba(255,255,255,.1)",borderRadius:16,cursor:"pointer",display:"flex",flexDirection:"column",alignItems:"center",gap:10}},
+        h("div",{style:{fontSize:40}},"\uD83D\uDCF8"),
+        h("div",{style:{fontSize:15,fontWeight:600,color:"#f8fafc"}},"Capture BP Monitor"),
+        h("div",{style:{fontSize:12,color:"#64748b",maxWidth:280,textAlign:"center",lineHeight:1.5}},"Tap to take a photo or choose from library")),
+      h("input",{id:"bp-cam",type:"file",accept:"image/*",onChange:handleCap}),
+      h("button",{style:Object.assign({},btnS,{width:"100%"}),onClick:function(){setManual(true);setTimeout(function(){var el=document.getElementById("man-sys");if(el)el.focus()},100)}},"\u270F\uFE0F Enter values manually"));
+  }
+
+  var manualSection=null;
+  if(!capImg&&manual){
+    manualSection=h("div",{style:card},
+      h("p",{style:{fontSize:14,fontWeight:600,marginBottom:20,color:"#f8fafc"}},"\u270F\uFE0F Manual Entry"),
+      h("div",{style:{display:"flex",gap:12,marginBottom:16}},
+        [{k:"sys",v:ms,s:setMs,c:"#ef4444",p:"120",n:"man-dia"},{k:"dia",v:md,s:setMd,c:"#3b82f6",p:"80",n:"man-pulse"},{k:"pulse",v:mp,s:setMp,c:"#a855f7",p:"72",n:null}].map(function(f){
+          return h("div",{key:f.k,style:{flex:1,textAlign:"center",padding:"10px 8px",borderRadius:10,background:f.c+"11",border:"1px solid "+f.c+"33"}},
+            h("div",{style:{fontSize:10,fontWeight:700,fontFamily:"var(--fm)",marginBottom:4,color:f.c}},f.k.toUpperCase()),
+            h("input",{id:"man-"+f.k,inputMode:"numeric",placeholder:f.p,value:f.v,
+              onChange:function(e){autoJ(e.target.value,f.s,3,f.n)},onFocus:function(e){e.target.select()},
+              style:{width:"100%",background:"transparent",border:"none",color:"#f8fafc",fontSize:26,fontWeight:700,fontFamily:"var(--fm)",textAlign:"center",padding:0,outline:"none"}}))})),
+      h("div",{style:{display:"flex",gap:10}},
+        h("button",{style:Object.assign({},btnS,{flex:1}),onClick:function(){setManual(false);setMs("");setMd("");setMp("")}},"Cancel"),
+        h("button",{style:Object.assign({},btnP(!ms||!md||!mp),{flex:2}),disabled:!ms||!md||!mp,onClick:function(){saveR(ms,md,mp)}},"Save Reading")));
+  }
+
+  var catRef=h("div",{style:{marginTop:20,padding:16,background:"rgba(255,255,255,.02)",borderRadius:12,border:"1px solid rgba(255,255,255,.04)"}},
+    h("p",{style:{fontSize:10,fontWeight:700,color:"#64748b",marginBottom:10,fontFamily:"var(--fm)"}},"AHA/ACC BLOOD PRESSURE CATEGORIES"),
+    CATS.map(function(c){return h("div",{key:c.label,style:{display:"flex",alignItems:"center",gap:8,marginBottom:4}},
+      h("div",{style:{width:8,height:8,borderRadius:2,background:c.color,flexShrink:0}}),
+      h("span",{style:{fontSize:11,color:"#94a3b8",flex:1}},c.label),
+      h("span",{style:{fontSize:10,color:"#64748b",fontFamily:"var(--fm)"}},c.range))}),
+    h("p",{style:{fontSize:9,color:"#475569",marginTop:8,lineHeight:1.5}},"Per 2017 ACC/AHA Guidelines. Tracking tool only \u2014 not a medical device."));
+
+  var capTab=h("div",null,latestCard,photoSection,captureButtons,manualSection,catRef);
+
+  // TRENDS TAB
+  var trendsTab;
+  if(readings.length<2){
+    trendsTab=h("div",{style:{textAlign:"center",padding:"60px 20px"}},h("div",{style:{fontSize:48,marginBottom:16}},"\uD83D\uDCCA"),h("p",{style:{color:"#94a3b8",fontSize:14}},"Take at least 2 readings to see trends"));
+  }else{
+    trendsTab=h("div",null,
+      h("div",{style:{display:"flex",gap:10,marginBottom:20}},
+        [{l:"AVG SYS",v:avg("sys"),u:"mmHg",c:"#ef4444"},{l:"AVG DIA",v:avg("dia"),u:"mmHg",c:"#3b82f6"},{l:"AVG PULSE",v:avg("pulse"),u:"bpm",c:"#a855f7"}].map(function(s){
+          return h("div",{key:s.l,style:{flex:1,textAlign:"center",padding:"16px 8px",background:srf,borderRadius:12,border:"1px solid "+brd}},
+            h("div",{style:{fontSize:9,fontWeight:700,fontFamily:"var(--fm)",marginBottom:4,color:s.c}},s.l),
+            h("div",{style:{fontSize:22,fontWeight:700,fontFamily:"var(--fm)",color:"#f8fafc"}},s.v),
+            h("div",{style:{fontSize:9,color:"#64748b"}},s.u))})),
+      h("div",{style:{background:srf,borderRadius:16,border:"1px solid "+brd,padding:"20px 8px 8px 0",marginBottom:16}},
+        h("p",{style:{fontSize:11,fontWeight:700,color:"#94a3b8",fontFamily:"var(--fm)",marginBottom:16,paddingLeft:20}},"BLOOD PRESSURE (mmHg)"),
+        h(RC.ResponsiveContainer,{width:"100%",height:220},
+          h(RC.AreaChart,{data:chartData},
+            h("defs",null,h("linearGradient",{id:"gS",x1:0,y1:0,x2:0,y2:1},h("stop",{offset:"5%",stopColor:"#ef4444",stopOpacity:.15}),h("stop",{offset:"95%",stopColor:"#ef4444",stopOpacity:0})),h("linearGradient",{id:"gD",x1:0,y1:0,x2:0,y2:1},h("stop",{offset:"5%",stopColor:"#3b82f6",stopOpacity:.15}),h("stop",{offset:"95%",stopColor:"#3b82f6",stopOpacity:0}))),
+            h(RC.CartesianGrid,{strokeDasharray:"3 3",stroke:"rgba(255,255,255,.05)"}),
+            h(RC.XAxis,{dataKey:"date",tick:{fill:"#64748b",fontSize:10},axisLine:false,tickLine:false}),
+            h(RC.YAxis,{domain:[40,200],tick:{fill:"#64748b",fontSize:10},axisLine:false,tickLine:false}),
+            h(RC.Tooltip,{content:h(ChartTip)}),
+            h(RC.ReferenceLine,{y:120,stroke:"rgba(34,197,94,.3)",strokeDasharray:"4 4"}),
+            h(RC.ReferenceLine,{y:80,stroke:"rgba(34,197,94,.3)",strokeDasharray:"4 4"}),
+            h(RC.Area,{type:"monotone",dataKey:"Systolic",stroke:"#ef4444",fill:"url(#gS)",strokeWidth:2.5,dot:{fill:"#ef4444",r:3,strokeWidth:0}}),
+            h(RC.Area,{type:"monotone",dataKey:"Diastolic",stroke:"#3b82f6",fill:"url(#gD)",strokeWidth:2.5,dot:{fill:"#3b82f6",r:3,strokeWidth:0}}),
+            h(RC.Legend,{wrapperStyle:{fontSize:11}}))),
+        h("p",{style:{fontSize:9,color:"#475569",paddingLeft:20,marginTop:4}},"Green dashed: Normal (120/80)")),
+      h("div",{style:{background:srf,borderRadius:16,border:"1px solid "+brd,padding:"20px 8px 8px 0",marginBottom:16}},
+        h("p",{style:{fontSize:11,fontWeight:700,color:"#94a3b8",fontFamily:"var(--fm)",marginBottom:16,paddingLeft:20}},"PULSE (bpm)"),
+        h(RC.ResponsiveContainer,{width:"100%",height:180},
+          h(RC.AreaChart,{data:chartData},
+            h("defs",null,h("linearGradient",{id:"gP",x1:0,y1:0,x2:0,y2:1},h("stop",{offset:"5%",stopColor:"#a855f7",stopOpacity:.2}),h("stop",{offset:"95%",stopColor:"#a855f7",stopOpacity:0}))),
+            h(RC.CartesianGrid,{strokeDasharray:"3 3",stroke:"rgba(255,255,255,.05)"}),
+            h(RC.XAxis,{dataKey:"date",tick:{fill:"#64748b",fontSize:10},axisLine:false,tickLine:false}),
+            h(RC.YAxis,{domain:[40,120],tick:{fill:"#64748b",fontSize:10},axisLine:false,tickLine:false}),
+            h(RC.Tooltip,{content:h(ChartTip)}),
+            h(RC.ReferenceLine,{y:60,stroke:"rgba(168,85,247,.2)",strokeDasharray:"4 4"}),
+            h(RC.ReferenceLine,{y:100,stroke:"rgba(168,85,247,.2)",strokeDasharray:"4 4"}),
+            h(RC.Area,{type:"monotone",dataKey:"Pulse",stroke:"#a855f7",fill:"url(#gP)",strokeWidth:2.5,dot:{fill:"#a855f7",r:3,strokeWidth:0}}))),
+        h("p",{style:{fontSize:9,color:"#475569",paddingLeft:20,marginTop:4}},"Normal resting: 60\u2013100 bpm (AHA)")),
+      h("button",{style:Object.assign({},btnE,{width:"100%",display:"flex",alignItems:"center",justifyContent:"center",gap:6}),onClick:expCSV},"\uD83D\uDCC4 Export Data as CSV"));
+  }
+
+  // HISTORY TAB
+  var histTab;
+  if(readings.length===0){
+    histTab=h("div",null,
+      h("input",{id:"bp-imp",type:"file",accept:".csv,text/csv",onChange:handleImp}),
+      h("div",{style:{textAlign:"center",padding:"60px 20px"}},
+        h("div",{style:{fontSize:48,marginBottom:16}},"\uD83D\uDCCB"),
+        h("p",{style:{color:"#94a3b8",fontSize:14}},"No readings recorded yet"),
+        h("label",{htmlFor:"bp-imp",style:Object.assign({},btnI,{display:"inline-block",marginTop:16,cursor:"pointer"})},"\uD83D\uDCC2 Import from CSV")));
+  }else{
+    histTab=h("div",null,
+      h("input",{id:"bp-imp",type:"file",accept:".csv,text/csv",onChange:handleImp}),
+      h("div",{style:{display:"flex",gap:10,marginBottom:8}},
+        h("button",{style:Object.assign({},btnE,{flex:1,display:"flex",alignItems:"center",justifyContent:"center",gap:6}),onClick:expCSV},"\uD83D\uDCC4 Export CSV"),
+        h("label",{htmlFor:"bp-imp",style:Object.assign({},btnI,{flex:1,display:"flex",alignItems:"center",justifyContent:"center",gap:6,cursor:"pointer",textAlign:"center"})},"\uD83D\uDCC2 Import CSV")),
+      h("p",{style:{fontSize:9,color:"#475569",textAlign:"center",margin:"8px 0"}},readings.length+" reading"+(readings.length!==1?"s":"")),
+      readings.map(function(r,i){
+        var cat=classify(r.sys,r.dia);
+        return h("div",{key:r.id,style:{background:srf,borderRadius:12,border:"1px solid "+brd,padding:"14px 16px",display:"flex",alignItems:"center",gap:14,marginBottom:8}},
+          h("div",{style:{width:4,height:40,borderRadius:2,background:cat.color,flexShrink:0}}),
+          h("div",{style:{flex:1,minWidth:0}},
+            h("div",null,h("span",{style:{fontSize:18,fontWeight:700,fontFamily:"var(--fm)",color:"#f8fafc"}},r.sys+"/"+r.dia),h("span",{style:{fontSize:14,fontWeight:600,fontFamily:"var(--fm)",color:"#a855f7",marginLeft:16}},r.pulse+" bpm")),
+            h("div",{style:{fontSize:10,color:"#64748b",fontFamily:"var(--fm)",marginTop:2}},(r.name?r.name+" \u00B7 ":"")+fmtF(r.timestamp))),
+          h("span",{style:{fontSize:9,fontWeight:700,fontFamily:"var(--fm)",padding:"3px 8px",borderRadius:6,color:cat.color,background:cat.color+"15",whiteSpace:"nowrap",flexShrink:0}},cat.label),
+          h("button",{style:{background:"none",border:"none",color:"#475569",cursor:"pointer",fontSize:16,padding:4},onClick:function(){delR(r.id)}},"\u00D7"))}));
+  }
+
+  var activeTab=null;
+  if(tab==="capture")activeTab=capTab;
+  else if(tab==="trends")activeTab=trendsTab;
+  else if(tab==="history")activeTab=histTab;
+
+  return h("div",{className:"shell"},header,
+    h("div",{style:{flex:1,overflowY:"auto",WebkitOverflowScrolling:"touch",padding:"20px 20px calc(env(safe-area-inset-bottom,0px) + 40px)"}},
+      h("div",{style:{maxWidth:600,margin:"0 auto"}},activeTab)));
+}
+
+try{ReactDOM.createRoot(mount).render(h(App))}
+catch(e){mount.innerHTML='<div class="boot-err"><div style="font-size:48px;margin-bottom:16px">\u26A0\uFE0F</div><div style="font-size:16px;font-weight:600;margin-bottom:8px">Render Error</div><div style="font-size:12px;color:#94a3b8">'+e.message+'</div></div>';console.error(e)}
+})();
+</script>
+</body>
+</html>
